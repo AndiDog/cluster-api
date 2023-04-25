@@ -184,6 +184,8 @@ func (r *KubeadmConfigReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	log = log.WithValues("Cluster", klog.KRef(configOwner.GetNamespace(), configOwner.ClusterName()))
 	ctx = ctrl.LoggerInto(ctx, log)
 
+	log.Info("Reconciling KubeadmConfig")
+
 	// Lookup the cluster the config owner is associated with
 	cluster, err := util.GetClusterByName(ctx, r.Client, configOwner.GetNamespace(), configOwner.ClusterName())
 	if err != nil {
@@ -267,8 +269,9 @@ func (r *KubeadmConfigReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			}
 			if configOwner.IsMachinePool() {
 				// If the BootstrapToken has been generated and infrastructure is ready but the configOwner is a MachinePool,
-				// we rotate the token to keep it fresh for future scale ups.
-				return r.rotateMachinePoolBootstrapToken(ctx, config, cluster, scope)
+				// we rotate the token to keep it fresh for future scale ups. Also, `spec.files`, `spec.preKubeadmCommands`
+				// and other fields represented in the cloud-init bootstrap data may have changed and must be reconciled.
+				return r.updateMachinePoolBootstrapData(ctx, config, cluster, scope)
 			}
 		}
 		// In any other case just return as the config is already generated and need not be generated again.
@@ -298,7 +301,7 @@ func (r *KubeadmConfigReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// It's a worker join
-	return r.joinWorker(ctx, scope)
+	return r.joinWorker(ctx, scope, 0)
 }
 
 func (r *KubeadmConfigReconciler) refreshBootstrapToken(ctx context.Context, config *bootstrapv1.KubeadmConfig, cluster *clusterv1.Cluster) (ctrl.Result, error) {
@@ -320,7 +323,7 @@ func (r *KubeadmConfigReconciler) refreshBootstrapToken(ctx context.Context, con
 	}, nil
 }
 
-func (r *KubeadmConfigReconciler) rotateMachinePoolBootstrapToken(ctx context.Context, config *bootstrapv1.KubeadmConfig, cluster *clusterv1.Cluster, scope *Scope) (ctrl.Result, error) {
+func (r *KubeadmConfigReconciler) updateMachinePoolBootstrapData(ctx context.Context, config *bootstrapv1.KubeadmConfig, cluster *clusterv1.Cluster, scope *Scope) (ctrl.Result, error) {
 	log := ctrl.LoggerFrom(ctx)
 	log.V(2).Info("Config is owned by a MachinePool, checking if token should be rotated")
 	remoteClient, err := r.remoteClientGetter(ctx, KubeadmConfigControllerName, r.Client, util.ObjectKey(cluster))
@@ -342,13 +345,11 @@ func (r *KubeadmConfigReconciler) rotateMachinePoolBootstrapToken(ctx context.Co
 
 		config.Spec.JoinConfiguration.Discovery.BootstrapToken.Token = token
 		log.V(3).Info("Altering JoinConfiguration.Discovery.BootstrapToken.Token")
-
-		// update the bootstrap data
-		return r.joinWorker(ctx, scope)
 	}
-	return ctrl.Result{
-		RequeueAfter: r.TokenTTL / 3,
-	}, nil
+
+	// Always consider updating the bootstrap data since other fields like `spec.files` could have changed, not only
+	// the bootstrap token
+	return r.joinWorker(ctx, scope, r.TokenTTL/3)
 }
 
 func (r *KubeadmConfigReconciler) handleClusterNotInitialized(ctx context.Context, scope *Scope) (_ ctrl.Result, reterr error) {
@@ -518,7 +519,7 @@ func (r *KubeadmConfigReconciler) handleClusterNotInitialized(ctx context.Contex
 	return ctrl.Result{}, nil
 }
 
-func (r *KubeadmConfigReconciler) joinWorker(ctx context.Context, scope *Scope) (ctrl.Result, error) {
+func (r *KubeadmConfigReconciler) joinWorker(ctx context.Context, scope *Scope, requeueAfter time.Duration) (ctrl.Result, error) {
 	scope.Info("Creating BootstrapData for the worker node")
 
 	certificates := secret.NewCertificatesForWorker(scope.Config.Spec.JoinConfiguration.CACertPath)
@@ -541,6 +542,7 @@ func (r *KubeadmConfigReconciler) joinWorker(ctx context.Context, scope *Scope) 
 	if res, err := r.reconcileDiscovery(ctx, scope.Cluster, scope.Config, certificates); err != nil {
 		return ctrl.Result{}, err
 	} else if !res.IsZero() {
+		res.RequeueAfter = requeueAfter
 		return res, nil
 	}
 
@@ -621,7 +623,7 @@ func (r *KubeadmConfigReconciler) joinWorker(ctx context.Context, scope *Scope) 
 		scope.Error(err, "Failed to store bootstrap data")
 		return ctrl.Result{}, err
 	}
-	return ctrl.Result{}, nil
+	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
 func (r *KubeadmConfigReconciler) joinControlplane(ctx context.Context, scope *Scope) (ctrl.Result, error) {
