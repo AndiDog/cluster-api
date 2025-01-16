@@ -87,6 +87,18 @@ func DumpAllResourcesAndLogs(ctx context.Context, clusterProxy ClusterProxy, art
 				{
 					GVK: schema.GroupVersionKind{
 						Version: corev1.SchemeGroupVersion.Version,
+						Kind:    "ReplicaSet",
+					},
+				},
+				{
+					GVK: schema.GroupVersionKind{
+						Version: corev1.SchemeGroupVersion.Version,
+						Kind:    "Deployment",
+					},
+				},
+				{
+					GVK: schema.GroupVersionKind{
+						Version: corev1.SchemeGroupVersion.Version,
 						Kind:    "Node",
 					},
 				},
